@@ -4,12 +4,14 @@ Tests for gsc_server.py.
 All Google API calls are mocked — no real credentials are needed to run these tests.
 Run with: pytest test_gsc_server.py -v
 """
+import asyncio
 import importlib
 import io
 import json
 import os
 import sys
 import tempfile
+import time
 import unittest
 from datetime import datetime, timedelta
 from unittest.mock import MagicMock, patch, PropertyMock
@@ -999,6 +1001,43 @@ class TestStdoutClean(unittest.TestCase):
 
         stdout_output = captured.getvalue()
         self.assertEqual(stdout_output, "", f"Unexpected stdout: {stdout_output!r}")
+
+
+class TestEventLoopNotBlocked(unittest.IsolatedAsyncioTestCase):
+    """The API client is synchronous; tools must not hold the event loop.
+
+    google-api-python-client blocks for the whole HTTPS round trip. If a tool
+    calls .execute() directly, every other in-flight tool call waits on it.
+    Two concurrent calls to the same tool should therefore overlap, not
+    serialise.
+    """
+
+    BLOCKING_SECONDS = 0.3
+
+    async def test_concurrent_tool_calls_overlap(self):
+        mod = _load_module()
+        service = _make_service()
+
+        def slow_execute():
+            time.sleep(self.BLOCKING_SECONDS)
+            return {"siteEntry": [
+                {"siteUrl": "https://example.com/", "permissionLevel": "siteOwner"}
+            ]}
+
+        service.sites().list().execute.side_effect = slow_execute
+
+        with patch("gsc_server.get_gsc_service", return_value=service):
+            started = time.perf_counter()
+            await asyncio.gather(mod.list_properties(), mod.list_properties())
+            elapsed = time.perf_counter() - started
+
+        serialised = self.BLOCKING_SECONDS * 2
+        self.assertLess(
+            elapsed,
+            serialised * 0.75,
+            f"two concurrent calls took {elapsed:.2f}s; serialised would be "
+            f"~{serialised:.2f}s, so the event loop is being blocked",
+        )
 
 
 if __name__ == "__main__":
